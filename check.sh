@@ -3,7 +3,7 @@
 # 检查是否提供了流量上限参数
 if [ "$#" -ne 1 ]; then
     echo " 用法错误：必须指定每月流量上限（单位：GB）"
-    echo "正确用法：wget -O - https://node1.meday.top/awsconfig.sh | bash -s -- 1700"
+    echo "正确用法：wget -O - https://raw.githubusercontent.com/lugarbaver/jddns_pubic/refs/heads/main/check.sh | bash -s -- 1900"
     exit 1
 fi
 
