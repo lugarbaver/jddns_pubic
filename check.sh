@@ -1,100 +1,70 @@
 #!/bin/bash
-# ================================================
-# check.sh — 一键部署 & 定时检查当月流量超限并关机
-# URL: https://raw.githubusercontent.com/lugarbaver/jddns_pubic/refs/heads/main/check.sh
-#
-# 用法：
-#   wget -O - https://raw.githubusercontent.com/lugarbaver/jddns_pubic/refs/heads/main/check.sh | bash -s -- <流量阈值GB> [网卡名称]
-#
-# 示例：
-#   wget -O - https://raw.githubusercontent.com/lugarbaver/jddns_pubic/refs/heads/main/check.sh | bash -s -- 1700        # 监听所有网卡
-#   wget -O - https://raw.githubusercontent.com/lugarbaver/jddns_pubic/refs/heads/main/check.sh | bash -s -- 1700 ens5   # 只监听 ens5
-# ================================================
 
-set -e
-
-# —— 参数检查 —— 
-if [ -z "$1" ]; then
-    echo " 错误：必须指定每月流量阈值（单位：GB）"
-    echo "用法：wget -O - https://raw.githubusercontent.com/lugarbaver/jddns_pubic/refs/heads/main/check.sh | bash -s -- <流量阈值GB> [网卡名称]"
+# 检查是否提供了足够的参数
+if [ "$#" -ne 2 ]; then
+    echo "Usage: $0 <interface_name> <traffic_limit>"
     exit 1
 fi
 
-TRAFFIC_LIMIT="$1"
-CUSTOM_IFACE="$2"
+# 参数
+interface_name=$1
+traffic_limit=$2
 
-# —— 安装依赖 —— 
-echo " 安装依赖：cron, vnstat, bc"
+# 更新包列表并安装cron服务
 sudo apt update
-sudo apt install -y cron vnstat bc
+sudo apt install cron -y
 
-# —— 配置 vnStat —— 
-echo " 配置 /etc/vnstat.conf"
-if [ -n "$CUSTOM_IFACE" ]; then
-    sudo sed -i 's|^Interface.*|Interface "'$CUSTOM_IFACE'"|' /etc/vnstat.conf
-else
-    sudo sed -i 's|^Interface.*|Interface "default"|' /etc/vnstat.conf
-fi
-sudo sed -i 's|^#* *UnitMode.*|UnitMode 1|'   /etc/vnstat.conf
-sudo sed -i 's|^#* *MonthRotate.*|MonthRotate 1|' /etc/vnstat.conf
+# 安装依赖
+sudo apt install vnstat bc -y
 
-# —— 重启并更新 vnstat 数据库 —— 
+# 配置vnstat
+sudo sed -i '0,/^;Interface ""/s//Interface '\"$interface_name\"'/' /etc/vnstat.conf
+sudo sed -i "0,/^;UnitMode.*/s//UnitMode 1/" /etc/vnstat.conf
+sudo sed -i "0,/^;MonthRotate.*/s//MonthRotate 1/" /etc/vnstat.conf
+
+# 重启vnstat服务
 sudo systemctl restart vnstat
-sleep 2
-vnstat --update
 
-# —— 部署实际检查脚本到 /root/check.sh —— 
-echo " 部署 /root/check.sh"
-sudo tee /root/check.sh > /dev/null << 'EOF'
+# 创建自动关机脚本check.sh
+cat << EOF | sudo tee /root/check.sh > /dev/null
 #!/bin/bash
-# 自动按月统计流量，超限关机
 
-traffic_limit=__TRAFFIC_LIMIT__   # GB
-custom_iface="__CUSTOM_IFACE__"
+# 网卡名称
+interface_name="$interface_name"
+# 流量阈值上限（以GB为单位）
+traffic_limit=$traffic_limit
 
-current_ym=$(date +%Y%m)
+# 更新网卡记录
+vnstat -i "$interface_name"
 
-get_iface_month_bytes() {
-    local iface="$1"
-    vnstat --dumpdb -i "$iface" 2>/dev/null \
-      | awk -F';' -v ym="$current_ym" \
-            '$1=="M" && $2==ym {print $3+$4; exit}' \
-      || echo 0
-}
+# 获取每月用量，\$11: 进站+出站流量; \$10: 出站流量; \$9: 进站流量
+TRAFF_USED=\$(vnstat --oneline b | awk -F';' '{print \$11}')
 
-total_bytes=0
-if [ -n "$custom_iface" ]; then
-    total_bytes=$(get_iface_month_bytes "$custom_iface")
-else
-    for iface in $(vnstat --iflist | grep -oP '(?<=\s)\w+'); do
-        total_bytes=$(( total_bytes + $(get_iface_month_bytes "$iface") ))
-    done
+# 检查是否获取到数据
+if [[ -z "\$TRAFF_USED" ]]; then
+    echo "Error: Not enough data available yet."
+    exit 1
 fi
 
-used_gb=$(echo "scale=2; $total_bytes / 1073741824" | bc)
+# 将流量转换为GB
+CHANGE_TO_GB=\$(echo "scale=2; \$TRAFF_USED / 1073741824" | bc)
 
-# 日志调试（如需启用，去掉下行注释）
-# echo "$(date '+%Y-%m-%d %H:%M:%S') used=${used_gb}GB limit=${traffic_limit}GB" >> /root/shutdown_debug.log
+# 检查转换后的流量是否为有效数字
+if ! [[ "\$CHANGE_TO_GB" =~ ^[0-9]+([.][0-9]+)?\$ ]]; then
+    echo "Error: Invalid traffic data."
+    exit 1
+fi
 
-if (( $(echo "$used_gb > $traffic_limit" | bc -l) )); then
-    echo " 当月已用 ${used_gb}GB，超过阈值 ${traffic_limit}GB，系统即将关机！"
+# 比较流量是否超过阈值
+if (( \$(echo "\$CHANGE_TO_GB > \$traffic_limit" | bc -l) )); then
     sudo /usr/sbin/shutdown -h now
 fi
 EOF
 
-# —— 用实际参数替换占位符 —— 
-sudo sed -i "s|__TRAFFIC_LIMIT__|${TRAFFIC_LIMIT}|" /root/check.sh
-sudo sed -i "s|__CUSTOM_IFACE__|${CUSTOM_IFACE}|"  /root/check.sh
-
-# —— 设置权限 & 定时任务 —— 
+# 授予权限
 sudo chmod +x /root/check.sh
-(crontab -l 2>/dev/null; \
- echo "*/3 * * * * /bin/bash /root/check.sh >> /root/shutdown_debug.log 2>&1") \
- | crontab -
 
-echo " 部署完成！每 3 分钟检测当月流量是否超过 ${TRAFFIC_LIMIT}GB。"
-if [ -n "$CUSTOM_IFACE" ]; then
-    echo " 仅监听网卡：${CUSTOM_IFACE}"
-else
-    echo " 监听所有网卡"
-fi
+# 设置定时任务，每5分钟执行一次检查
+(crontab -l ; echo "*/3 * * * * /bin/bash /root/check.sh > /root/shutdown_debug.log 2>&1") | crontab -
+
+echo "大功告成！脚本已安装并配置完成。"
