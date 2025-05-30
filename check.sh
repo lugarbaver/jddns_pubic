@@ -1,62 +1,77 @@
 #!/bin/bash
+# ================================================
+# check.sh — 一键部署 & 定时检查当月流量超限并关机
+# URL: https://raw.githubusercontent.com/lugarbaver/jddns_pubic/refs/heads/main/check.sh
+#
+# 用法：
+#   wget -O - https://raw.githubusercontent.com/lugarbaver/jddns_pubic/refs/heads/main/check.sh | bash -s -- <流量阈值GB> [网卡名称]
+#
+# 示例：
+#   wget -O - https://raw.githubusercontent.com/lugarbaver/jddns_pubic/refs/heads/main/check.sh | bash -s -- 1700        # 监听所有网卡
+#   wget -O - https://raw.githubusercontent.com/lugarbaver/jddns_pubic/refs/heads/main/check.sh | bash -s -- 1700 ens5   # 只监听 ens5
+# ================================================
 
-# 检查是否提供了流量上限参数
-if [ "$#" -ne 1 ]; then
-    echo " 用法错误：必须指定每月流量上限（单位：GB）"
-    echo "正确用法：wget -O - https://raw.githubusercontent.com/lugarbaver/jddns_pubic/refs/heads/main/check.sh | bash -s -- 1900"
+set -e
+
+# —— 参数检查 —— 
+if [ -z "$1" ]; then
+    echo " 错误：必须指定每月流量阈值（单位：GB）"
+    echo "wget -O - https://raw.githubusercontent.com/lugarbaver/jddns_pubic/refs/heads/main/check.sh | bash -s -- <流量阈值GB> [网卡名称]"
     exit 1
 fi
 
-traffic_limit=$1
+TRAFFIC_LIMIT="$1"
+CUSTOM_IFACE="$2"
 
-# 安装必要组件
+# —— 安装依赖 —— 
+echo " 安装依赖：cron, vnstat, bc"
 sudo apt update
-sudo apt install cron vnstat bc -y
+sudo apt install -y cron vnstat bc
 
-# 检测默认网卡（取第一个有流量的网卡）
-default_iface=$(vnstat --iflist | grep -oP '(?<=\s)\w+' | head -n 1)
+# —— 配置 vnStat —— 
+echo " 配置 /etc/vnstat.conf"
+if [ -n "$CUSTOM_IFACE" ]; then
+    sudo sed -i 's|^Interface.*|Interface "'$CUSTOM_IFACE'"|' /etc/vnstat.conf
+else
+    sudo sed -i 's|^Interface.*|Interface "default"|' /etc/vnstat.conf
+fi
+sudo sed -i 's|^#* *UnitMode.*|UnitMode 1|'   /etc/vnstat.conf
+sudo sed -i 's|^#* *MonthRotate.*|MonthRotate 1|' /etc/vnstat.conf
 
-# 修改 vnstat 配置
-sudo sed -i 's/^Interface.*/Interface "default"/' /etc/vnstat.conf
-sudo sed -i 's/^#* *UnitMode.*/UnitMode 1/' /etc/vnstat.conf
-sudo sed -i 's/^#* *MonthRotate.*/MonthRotate 1/' /etc/vnstat.conf
-
-# 重启 vnstat
+# —— 重启并更新 vnstat 数据库 —— 
 sudo systemctl restart vnstat
 sleep 2
 vnstat --update
 
-# 创建关机检测脚本
-cat << EOF | sudo tee /root/check.sh > /dev/null
+# —— 部署实际检查脚本到 /root/check.sh —— 
+echo " 部署 /root/check.sh"
+sudo tee /root/check.sh > /dev/null << 'EOF'
 #!/bin/bash
+# 自动按月统计流量，超限关机
 
-# 获取所有网卡
-interfaces=\$(vnstat --iflist | grep -oP '(?<=\s)\w+')
+traffic_limit=__TRAFFIC_LIMIT__   # GB
+custom_iface="__CUSTOM_IFACE__"
 
-# 流量阈值（GB）
-traffic_limit=$traffic_limit
-total_used_bytes=0
+current_ym=$(date +%Y%m)
 
-for iface in \$interfaces; do
-    # 提取当月流量
-    month_data=\$(vnstat -i \$iface --json | grep -A20 '"months"' | grep '"rx":\| "tx":' | head -n 2 | awk -F ':' '{sum+=\$2} END {print sum}')
-    total_used_bytes=\$((total_used_bytes + month_data))
-done
+get_iface_month_bytes() {
+    local iface="$1"
+    vnstat --dumpdb -i "$iface" 2>/dev/null \
+      | awk -F';' -v ym="$current_ym" \
+            '$1=="M" && $2==ym {print $3+$4; exit}' \
+      || echo 0
+}
 
-# 转换单位
-used_gb=\$(echo "scale=2; \$total_used_bytes / 1073741824" | bc)
-
-# 比较阈值
-if (( \$(echo "\$used_gb > \$traffic_limit" | bc -l) )); then
-    echo "流量 \$used_gb GB 超过限制 \$traffic_limit GB，执行关机"
-    sudo /usr/sbin/shutdown -h now
+total_bytes=0
+if [ -n "$custom_iface" ]; then
+    total_bytes=$(get_iface_month_bytes "$custom_iface")
+else
+    for iface in $(vnstat --iflist | grep -oP '(?<=\s)\w+'); do
+        total_bytes=$(( total_bytes + $(get_iface_month_bytes "$iface") ))
+    done
 fi
-EOF
 
-# 添加执行权限
-sudo chmod +x /root/check.sh
+used_gb=$(echo "scale=2; $total_bytes / 1073741824" | bc)
 
-# 添加定时任务（每3分钟检查一次）
-(crontab -l 2>/dev/null; echo "*/3 * * * * /bin/bash /root/check.sh > /root/shutdown_debug.log 2>&1") | crontab -
-
-echo " 安装完成！将每3分钟检查当月所有网卡总流量是否超过 ${traffic_limit}GB。"
+# 日志调试（如需启用，去掉下行注释）
+# echo "$(date '+%Y-%m-%d %H:%M:%S') used=${used_gb}GB limit=${traffic_limit}GB" >> /root/shutd
