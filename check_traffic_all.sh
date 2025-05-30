@@ -1,70 +1,99 @@
 #!/bin/bash
 #
 # check_traffic_all.sh
-# 用途：检测所有网卡（除 lo）累计流量，超过自定义阈值则关机
+# 用途：
+#   1) 无参：输出本月流量统计（上行/下行/总计，单位 GB）
+#   2) 带参：检测本月总流量是否超过给定阈值（单位 GB），超出则关机
 # 用法：
-#   sudo bash check_traffic_all.sh THRESHOLD_TB
-#   THRESHOLD_TB: 必填，阈值（单位 TB），支持整数或小数
+#   sudo bash check_traffic_all.sh          # 只打印统计
+#   sudo bash check_traffic_all.sh 2000     # 阈值 2000 GB，超出关机
 
 set -euo pipefail
 
-# ---- 参数 & 配置 ----
-if [[ $# -ne 1 ]]; then
-    echo "Usage: $0 THRESHOLD_TB" >&2
-    echo "  THRESHOLD_TB: 流量阈值，单位 TB，必须指定" >&2
-    exit 1
-fi
-
-THRESHOLD_TB="$1"
 STATE_FILE="/var/lib/traffic_monitor_all.state"
-# 转换 TB 到字节（1024^4）
-THRESHOLD_BYTES=$(awk "BEGIN { printf(\"%.0f\", $THRESHOLD_TB * 1024^4) }")
 
-# ---- 获取所有网卡的累计字节数 ----
-get_bytes_all() {
-    local total=0
+# ---- 工具：统计所有非 lo 网卡的 rx/tx 字节数 ----
+get_stats() {
+    local rx_total=0 tx_total=0
     for path in /sys/class/net/*; do
         iface=$(basename "$path")
         [[ "$iface" == "lo" ]] && continue
-        for stat in rx_bytes tx_bytes; do
-            [[ -f "$path/statistics/$stat" ]] && total=$(( total + $(<"$path/statistics/$stat") ))
-        done
+        if [[ -f "$path/statistics/rx_bytes" ]]; then
+            rx_total=$(( rx_total + $(<"$path/statistics/rx_bytes") ))
+        fi
+        if [[ -f "$path/statistics/tx_bytes" ]]; then
+            tx_total=$(( tx_total + $(<"$path/statistics/tx_bytes") ))
+        fi
     done
-    echo "$total"
+    printf "%d %d\n" "$rx_total" "$tx_total"
 }
 
-# ---- 主流程 ----
-CUR_MONTH=$(date +%Y-%m)
-CUR_BYTES=$(get_bytes_all)
+# ---- 工具：字节转 GB，保留两位小数 ----
+bytes_to_gb() {
+    awk -v b="$1" 'BEGIN { printf("%.2f", b/1024/1024/1024) }'
+}
 
-# 初始化状态文件或跨月重置
+# ---- 主流程：读取或初始化状态文件 ----
+CUR_MONTH=$(date +%Y-%m)
+read cur_rx cur_tx < <( get_stats )
+
 if [[ ! -r "$STATE_FILE" ]]; then
     mkdir -p "$(dirname "$STATE_FILE")"
     cat > "$STATE_FILE" <<EOF
 first_run=yes
 saved_month=$CUR_MONTH
-base_bytes=0
+base_rx=0
+base_tx=0
 EOF
 fi
-# 导入状态
 source "$STATE_FILE"
 
+# 每月首次运行时重置基准
 if [[ "$first_run" == "yes" || "$saved_month" != "$CUR_MONTH" ]]; then
-    echo "[$(date)] 重置基准：月份 $CUR_MONTH，基准字节数 = $CUR_BYTES"
     cat > "$STATE_FILE" <<EOF
 first_run=no
 saved_month=$CUR_MONTH
-base_bytes=$CUR_BYTES
+base_rx=$cur_rx
+base_tx=$cur_tx
 EOF
+    # 如果只是打印统计，重置后本月流量自然为 0
+    if [[ $# -eq 0 ]]; then
+        echo "本月已用：上行 0.00 GB，下行 0.00 GB，总计 0.00 GB"
+    fi
     exit 0
 fi
 
-# 计算本月已用流量
-DELTA_BYTES=$(( CUR_BYTES - base_bytes ))
-echo "[$(date)] 已用 ${DELTA_BYTES}B，阈值 ${THRESHOLD_BYTES}B（${THRESHOLD_TB}TB）"
+# 计算本月增量
+delta_rx=$(( cur_rx - base_rx ))
+delta_tx=$(( cur_tx - base_tx ))
+delta_total=$(( delta_rx + delta_tx ))
 
-# 超过阈值则关机
-if (( DELTA_BYTES >= THRESHOLD_BYTES )); then
-    wall "流量已超 ${THRESHOLD_TB}TB，1 分钟后自动关机。"
-    shutdown -h +1 "流量超过 ${THRESHOLD_TB}TB，自动关机"
+# 模式分支
+if [[ $# -eq 0 ]]; then
+    # 只打印统计
+    up_gb=$(bytes_to_gb "$delta_tx")
+    down_gb=$(bytes_to_gb "$delta_rx")
+    tot_gb=$(bytes_to_gb "$delta_total")
+    echo "本月已用：上行 ${up_gb} GB，下行 ${down_gb} GB，总计 ${tot_gb} GB"
+    exit 0
+elif [[ $# -eq 1 ]]; then
+    # 带阈值检测
+    threshold_gb="$1"
+    # GB 转 字节
+    threshold_bytes=$(awk "BEGIN { printf(\"%.0f\", $threshold_gb * 1024^3) }")
+    # 输出当前统计
+    up_gb=$(bytes_to_gb "$delta_tx")
+    down_gb=$(bytes_to_gb "$delta_rx")
+    tot_gb=$(bytes_to_gb "$delta_total")
+    echo "本月已用：上行 ${up_gb} GB，下行 ${down_gb} GB，总计 ${tot_gb} GB，阈值 ${threshold_gb} GB"
+    if (( delta_total >= threshold_bytes )); then
+        wall "流量已超 ${threshold_gb} GB，1 分钟后自动关机。"
+        shutdown -h +1 "流量超过 ${threshold_gb} GB，自动关机"
+    fi
+    exit 0
+else
+    echo "Usage: $0 [THRESHOLD_GB]" >&2
+    echo "  无参：打印本月流量统计" >&2
+    echo "  带参：THRESHOLD_GB=阈值（单位 GB），超出则关机" >&2
+    exit 1
 fi
