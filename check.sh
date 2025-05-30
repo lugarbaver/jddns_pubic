@@ -16,7 +16,7 @@ set -e
 # —— 参数检查 —— 
 if [ -z "$1" ]; then
     echo " 错误：必须指定每月流量阈值（单位：GB）"
-    echo "wget -O - https://raw.githubusercontent.com/lugarbaver/jddns_pubic/refs/heads/main/check.sh | bash -s -- <流量阈值GB> [网卡名称]"
+    echo "用法：wget -O - https://raw.githubusercontent.com/lugarbaver/jddns_pubic/refs/heads/main/check.sh | bash -s -- <流量阈值GB> [网卡名称]"
     exit 1
 fi
 
@@ -74,4 +74,27 @@ fi
 used_gb=$(echo "scale=2; $total_bytes / 1073741824" | bc)
 
 # 日志调试（如需启用，去掉下行注释）
-# echo "$(date '+%Y-%m-%d %H:%M:%S') used=${used_gb}GB limit=${traffic_limit}GB" >> /root/shutd
+# echo "$(date '+%Y-%m-%d %H:%M:%S') used=${used_gb}GB limit=${traffic_limit}GB" >> /root/shutdown_debug.log
+
+if (( $(echo "$used_gb > $traffic_limit" | bc -l) )); then
+    echo " 当月已用 ${used_gb}GB，超过阈值 ${traffic_limit}GB，系统即将关机！"
+    sudo /usr/sbin/shutdown -h now
+fi
+EOF
+
+# —— 用实际参数替换占位符 —— 
+sudo sed -i "s|__TRAFFIC_LIMIT__|${TRAFFIC_LIMIT}|" /root/check.sh
+sudo sed -i "s|__CUSTOM_IFACE__|${CUSTOM_IFACE}|"  /root/check.sh
+
+# —— 设置权限 & 定时任务 —— 
+sudo chmod +x /root/check.sh
+(crontab -l 2>/dev/null; \
+ echo "*/3 * * * * /bin/bash /root/check.sh >> /root/shutdown_debug.log 2>&1") \
+ | crontab -
+
+echo " 部署完成！每 3 分钟检测当月流量是否超过 ${TRAFFIC_LIMIT}GB。"
+if [ -n "$CUSTOM_IFACE" ]; then
+    echo " 仅监听网卡：${CUSTOM_IFACE}"
+else
+    echo " 监听所有网卡"
+fi
